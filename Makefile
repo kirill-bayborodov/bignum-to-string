@@ -7,6 +7,26 @@ USE_ASM ?= auto
 REPORT_NAME ?= current
 # Benchmark input mode: all_zero | all_nonzero | mixed
 DATA_MODE ?= all_nonzero
+# Benchmark executable environment (not Make variables):
+# BIGNUM_BENCH_ITERATIONS=<positive integer> limits ST calls (default: 2000000000).
+# BIGNUM_BENCH_MT_TOTAL_ITERATIONS=<positive integer> limits total MT calls;
+# it must be divisible by MT_THREADS (default: 3200000000).
+# BIGNUM_BENCH_SEED=<integer> makes pregenerated input data reproducible.
+# Use these only for smoke tests; use the default workload for performance studies.
+# Matrix benchmark settings. The matrix executes its declared profiles directly
+# and writes raw samples plus a statistical JSON summary.
+BENCH_MATRIX_PROFILE ?= $(BENCH_DIR)/profiles/$(LIB_NAME)_full.json
+BENCH_MATRIX_REPETITIONS ?= 7
+BENCH_MATRIX_ITERATIONS ?= 200000000
+BENCH_MATRIX_MT_TOTAL_ITERATIONS ?= 320000000
+BENCH_MATRIX_WARMUP ?= 10000
+BENCH_MATRIX_DATA_COUNT ?= 4096
+BENCH_MATRIX_SEED ?= 0x9E3779B97F4A7C15
+BENCH_MATRIX_TIMEOUT_SECONDS ?= 1800
+BENCH_REGRESSION_THRESHOLD_PCT ?= 5
+# Set BENCH_BASELINE to a reviewed matrix or summary JSON to make bench_matrix
+# fail on a confirmed regression or an incomplete profile set.
+BENCH_BASELINE ?=
 # values: no | address | undefined
 SAN ?= no
 # yes — прогнать *_mt тесты под valgrind --tool=helgrind
@@ -52,6 +72,23 @@ DIST_DIR = dist
 CORE_NAME := $(FAMILY_NAME)-core
 CORE_DIR  := $(LIBS_DIR)/$(CORE_NAME)
 REPORTS_DIR = $(BENCH_DIR)/reports
+# Pinned C11 framework dependency. CI installs the reviewed public v1.0.0
+# flat distribution under dist; this project consumes its header, archive and tools.
+BENCHMARK_FRAMEWORK_DIR := $(LIBS_DIR)/benchmark-framework
+BENCHMARK_CORE_DIR := $(BENCHMARK_FRAMEWORK_DIR)/$(DIST_DIR)
+BENCHMARK_CORE_INCLUDE := $(BENCHMARK_CORE_DIR)
+BENCHMARK_CORE_LIB := $(BENCHMARK_CORE_DIR)/libbenchmark_framework.a
+BENCH_MATRIX_TOOL := $(BENCHMARK_CORE_DIR)/tools/bench_matrix
+BENCH_STATS_TOOL := $(BENCHMARK_CORE_DIR)/tools/benchmark_stats
+BENCH_ADAPTER_DIR := $(BENCH_DIR)/adapter
+BENCH_ADAPTER_SOURCE := $(BENCH_ADAPTER_DIR)/$(LIB_NAME)_benchmark_adapter.c
+BENCH_ADAPTER_HEADER := $(BENCH_ADAPTER_DIR)/$(LIB_NAME)_benchmark_adapter.h
+BENCH_ADAPTER_OBJ := $(BUILD_DIR)/$(LIB_NAME)_benchmark_adapter.o
+BENCH_ADAPTER_TEST_SOURCE := $(TESTS_DIR)/benchmark_adapter/test_$(LIB_NAME)_benchmark_adapter.c
+BENCH_ADAPTER_TEST_BIN := $(BIN_DIR)/test_$(LIB_NAME)_benchmark_adapter
+BENCH_MATRIX_PROFILE ?= $(BENCH_DIR)/profiles/$(LIB_NAME)_full.json
+BENCH_MATRIX_REPORT ?= $(REPORTS_DIR)/$(REPORT_NAME)_matrix.json
+BENCH_MATRIX_SUMMARY ?= $(REPORTS_DIR)/$(REPORT_NAME)_matrix_summary.json
 DIST_INCLUDE_DIR = $(DIST_DIR)/$(INCLUDE_DIR)
 DIST_LIB_DIR = $(DIST_DIR)/$(LIBS_DIR)
 
@@ -64,6 +101,10 @@ SUBMODULES := $(strip $(filter $(CORE_NAME),$(SUBMODULES_RAW)) $(filter-out $(CO
 # Отделяем сабмодули с исходниками (есть Makefile) от вендорных (нет Makefile)
 SRC_SUBMODULES  := $(strip $(foreach d,$(SUBMODULES),$(if $(wildcard $(LIBS_DIR)/$(d)/Makefile),$(d),)))
 DIST_SUBMODULES := $(strip $(foreach d,$(SUBMODULES),$(if $(filter $(d),$(SRC_SUBMODULES)),,$(d))))
+# benchmark-framework is built only by benchmark_framework. The generic loop
+# appends root CFLAGS as a command-line override, which would otherwise leak
+# incompatible include paths into json-lib's independent C11 build.
+GENERIC_BUILD_SUBMODULES := $(filter-out benchmark-framework,$(SRC_SUBMODULES))
 
 
 # Генерируем все возможные пути для обоих типов модулей
@@ -90,32 +131,32 @@ ifneq ($(wildcard $(INCLUDE_DIR)/$(FAMILY_NAME).h),)
 else
     # 2. Проверяем стандартные пути общего модуля (CORE_NAME)
     ifneq ($(filter $(CORE_NAME),$(DIST_SUBMODULES)),)
-        CORE_DIST_PATH = $(LIBS_DIR)/$(CORE_NAME)/$(DIST_DIR)
-        CORE_INC_PATH  = $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)
-        
-        # Проверяем, существует ли файл в DIST, если нет - в INC
-        ifneq ($(wildcard $(CORE_DIST_PATH)/$(FAMILY_NAME).h),)
-            FAMILY_PATH = $(CORE_DIST_PATH)
-        else
-            ifneq ($(wildcard $(CORE_INC_PATH)/$(FAMILY_NAME).h),)
-                FAMILY_PATH = $(CORE_INC_PATH)
-            else
-                # 3. ФИНАЛЬНЫЙ ВАРИАНТ: Если в стандартных местах нет,
-                # ищем файл вообще по всем путям субмодулей
-                # Находим полный путь к файлу, а затем отсекаем имя файла, чтобы оставить только папку
-                FOUND_FILE := $(wildcard $(foreach dir,$(SUBMODULES_INCLUDE_DIR),$(dir)/$(FAMILY_NAME).h))
-                FAMILY_PATH := $(patsubst %/$(FAMILY_NAME).h,%,$(FOUND_FILE))
-            endif
-        endif
+	CORE_DIST_PATH = $(LIBS_DIR)/$(CORE_NAME)/$(DIST_DIR)
+	CORE_INC_PATH  = $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)
+
+	# Проверяем, существует ли файл в DIST, если нет - в INC
+	ifneq ($(wildcard $(CORE_DIST_PATH)/$(FAMILY_NAME).h),)
+	    FAMILY_PATH = $(CORE_DIST_PATH)
+	else
+	    ifneq ($(wildcard $(CORE_INC_PATH)/$(FAMILY_NAME).h),)
+	        FAMILY_PATH = $(CORE_INC_PATH)
+	    else
+	        # 3. ФИНАЛЬНЫЙ ВАРИАНТ: Если в стандартных местах нет,
+	        # ищем файл вообще по всем путям субмодулей
+	        # Находим полный путь к файлу, а затем отсекаем имя файла, чтобы оставить только папку
+	        FOUND_FILE := $(wildcard $(foreach dir,$(SUBMODULES_INCLUDE_DIR),$(dir)/$(FAMILY_NAME).h))
+	        FAMILY_PATH := $(patsubst %/$(FAMILY_NAME).h,%,$(FOUND_FILE))
+	    endif
+	endif
     else
-        # Если CORE_NAME не в DIST_SUBMODULES, пробуем его INCLUDE
-        ifneq ($(wildcard $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)/$(FAMILY_NAME).h),)
-            FAMILY_PATH = $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)
-        else
-            # Аналогичный поиск по всем путям, если даже тут не нашли
-            FOUND_FILE := $(wildcard $(foreach dir,$(SUBMODULES_INCLUDE_DIR),$(dir)/$(FAMILY_NAME).h))
-            FAMILY_PATH := $(patsubst %/$(FAMILY_NAME).h,%,$(FOUND_FILE))
-        endif
+	# Если CORE_NAME не в DIST_SUBMODULES, пробуем его INCLUDE
+	ifneq ($(wildcard $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)/$(FAMILY_NAME).h),)
+	    FAMILY_PATH = $(LIBS_DIR)/$(CORE_NAME)/$(INCLUDE_DIR)
+	else
+	    # Аналогичный поиск по всем путям, если даже тут не нашли
+	    FOUND_FILE := $(wildcard $(foreach dir,$(SUBMODULES_INCLUDE_DIR),$(dir)/$(FAMILY_NAME).h))
+	    FAMILY_PATH := $(patsubst %/$(FAMILY_NAME).h,%,$(FOUND_FILE))
+	endif
     endif
 endif
 # FAMILY_HEADER берется именно из того пути, который мы определили динамически
@@ -133,7 +174,7 @@ SUBMODULES_DIST_DIR := $(foreach d,$(DIST_SUBMODULES),$(LIBS_DIR)/$(d)/$(DIST_DI
 SUBMODULES_DIST_LIB := $(foreach d,$(DIST_SUBMODULES),$(subst -,_,$(d)))
 
 # Собираем OBJECTS только для тех сабмодулей, у которых реально есть исходники в src/
-OBJECTS         := $(foreach d,$(SRC_SUBMODULES),$(if $(wildcard $(LIBS_DIR)/$(d)/src/$(subst -,_,$(d)).c $(LIBS_DIR)/$(d)/src/$(subst -,_,$(d)).asm),$(LIBS_DIR)/$(d)/build/$(subst -,_,$(d)).o,))
+OBJECTS         := $(foreach d,$(GENERIC_BUILD_SUBMODULES),$(if $(wildcard $(LIBS_DIR)/$(d)/src/$(subst -,_,$(d)).c $(LIBS_DIR)/$(d)/src/$(subst -,_,$(d)).asm),$(LIBS_DIR)/$(d)/build/$(subst -,_,$(d)).o,))
 
 # Собираем все заголовочные файлы сабмодулей
 SRC_SUBMODULES_HEADERS_RAW := $(foreach dir,$(SRC_SUBMODULES_INCLUDE_DIR),$(wildcard $(dir)/*.h))
@@ -155,9 +196,9 @@ ASM_SRC := $(SRC_DIR)/$(LIB_NAME).asm
 
 ifeq ($(strip $(USE_ASM)),auto)
     ifneq ($(wildcard $(ASM_SRC)),)
-        SRC_EXT := asm
+	SRC_EXT := asm
     else
-        SRC_EXT := c
+	SRC_EXT := c
     endif
 else ifeq ($(strip $(USE_ASM)),yes)
     SRC_EXT := asm
@@ -172,6 +213,7 @@ OBJ = $(BUILD_DIR)/$(LIB_NAME).o
 TEST_SRCS := $(wildcard $(TESTS_DIR)/*.c)
 TEST_BINS_MT := $(filter $(TESTS_DIR)/%_mt.c,$(TEST_SRCS))
 TEST_BINS    := $(patsubst $(TESTS_DIR)/%.c,$(BIN_DIR)/%,$(TEST_SRCS))
+ALL_TEST_BINS := $(TEST_BINS) $(BENCH_ADAPTER_TEST_BIN)
 
 BENCH_BIN = bench_$(LIB_NAME)
 BENCH_BIN_ST = $(BIN_DIR)/$(BENCH_BIN)
@@ -186,14 +228,14 @@ STATIC_LIB = $(DIST_DIR)/lib$(LIB_NAME).a
 SINGLE_HEADER = $(DIST_DIR)/$(LIB_NAME).h
 
 # --- Flags ---
-CFLAGS_BASE = -std=c11 -Wall -Wextra -pedantic -I$(INCLUDE_DIR) $(addprefix -I , $(SUBMODULES_INCLUDE_DIR))
+CFLAGS_BASE = -std=c11 -Wall -Wextra -pedantic -I$(INCLUDE_DIR) -I$(BENCH_ADAPTER_DIR) -I$(BENCHMARK_CORE_INCLUDE) $(addprefix -I , $(SUBMODULES_INCLUDE_DIR))
 ASFLAGS_BASE = -f elf64
-LDFLAGS = -no-pie -lm 
+LDFLAGS = -no-pie -lm
 
 # Динамически линкуем все вендорные библиотеки (те, что попали в DIST_SUBMODULES)
 # Заменяем дефисы на подчеркивания для имени библиотеки (например, bignum-common -> -lbignum_common)
 # $(addprefix -L, $(SUBMODULES_DIST_DIR)) $(addprefix -l, $(SUBMODULES_DIST_LIB))
-LDFLAGS += $(foreach d,$(DIST_SUBMODULES),-L$(LIBS_DIR)/$(d)/dist -l$(subst -,_,$(d))) 
+LDFLAGS += $(foreach d,$(DIST_SUBMODULES),-L$(LIBS_DIR)/$(d)/dist -l$(subst -,_,$(d)))
 
 #Особый случай/Special Case
 ifeq ($(strip $(OPERATION_NAME)),shift-right)
@@ -246,7 +288,10 @@ endif
 space := $(empty) $(empty)
 ASM_LABELS := $(subst $(space),|,$(ASM_LABELS))
 
-PERF_SYMBOL_FILTER = '$(LIB_NAME)\.($(ASM_LABELS))'
+# perf --symbol-filter uses literal substring matching rather than a regex.
+# LIB_NAME therefore selects the public entry symbol and all module-owned
+# helpers, including C `_` names and ASM-qualified labels, for every module.
+PERF_SYMBOL_FILTER = $(LIB_NAME)
 # Raw perf.data сохраняются рядом с текстовыми отчётами для повторного анализа.
 PERF_DATA_ST = $(REPORTS_DIR)/$(REPORT_NAME)_st.perf.data
 PERF_DATA_MT = $(REPORTS_DIR)/$(REPORT_NAME)_mt.perf.data
@@ -262,16 +307,16 @@ KEEP_PERF ?= 1
 RECORD_OPT = -F 1000 -m 16M -e cycles,cache-misses,branch-misses -g --call-graph fp
 REPORT_OPT = --percent-limit 1.0 --sort comm,dso,symbol --symbol-filter=$(PERF_SYMBOL_FILTER)
 
-.PHONY: all build lint test test_sanitize test_helgrind bench bench_full bench_stat bench_stat_st bench_stat_mt install generate-header dist clean help show-calc unlink-symlink
+.PHONY: all build benchmark_framework lint docs test test_sanitize test_helgrind bench bench_full bench_cl bench_matrix bench_stat bench_stat_st bench_stat_mt install generate-header dist clean help show-calc unlink-symlink
 
-all: build 
-build: $(OBJ) $(OBJECTS) 
+all: build
+build: $(OBJ) $(OBJECTS)
 
 # --- Обычный прогон: однократно, без санитайзеров.
-test: $(FAMILY_SYMLINK) $(TEST_BINS)
+test: $(FAMILY_SYMLINK) $(ALL_TEST_BINS)
 	@echo "=== Running unit tests (CONFIG=$(CONFIG), SAN=$(SAN_LABEL)) ==="
 	@total=0; fail=0; \
-	for t in $(TEST_BINS); do \
+	for t in $(ALL_TEST_BINS); do \
 	  total=$$((total+1)); \
 	  echo "--- $$t ---"; \
 	  if ./$$t; then :; else fail=$$((fail+1)); echo "*** $$t FAILED ***"; fi; \
@@ -290,10 +335,10 @@ test: $(FAMILY_SYMLINK) $(TEST_BINS)
 # Использование:
 #   make test_sanitize SAN=address
 #   make test_sanitize SAN=undefined CONFIG=debug
-test_sanitize: $(FAMILY_SYMLINK) $(TEST_BINS)
+test_sanitize: $(FAMILY_SYMLINK) $(ALL_TEST_BINS)
 	@echo "=== Running tests under $(SAN_LABEL) (CONFIG=$(CONFIG)) ==="
 	@total=0; fail=0; san_fail=0; \
-	for t in $(TEST_BINS); do \
+	for t in $(ALL_TEST_BINS); do \
 	  total=$$((total+1)); \
 	  name=$$(basename $$t); \
 	  log=$(SAN_LOG_PREFIX)$$name.log; \
@@ -350,7 +395,7 @@ test_helgrind: $(FAMILY_SYMLINK) $(TEST_BINS)
 
 # rev.12: clean убран из зависимостей; ST и MT — отдельные таргеты;
 # MT бенмарк собирается с -pthread.
-bench: $(FAMILY_SYMLINK) $(REPORTS_DIR) bench_st bench_mt 
+bench: $(FAMILY_SYMLINK) $(REPORTS_DIR) bench_st bench_mt
 	@echo ""
 	@echo "Both bench reports written to $(REPORTS_DIR)/"
 	@ls -l $(REPORTS_DIR)/$(REPORT_NAME)_*.txt
@@ -361,7 +406,7 @@ bench_st: $(FAMILY_SYMLINK) $(BENCH_BIN_ST)
 	@sudo sysctl -w kernel.perf_event_max_sample_rate=10000 > /dev/null
 	@rm -f $(BENCH_RUNTIME_ST)
 	@taskset 0x1 $(PERF) record $(RECORD_OPT) -o $(PERF_DATA_ST) -- $(BENCH_BIN_ST) --data-mode $(DATA_MODE) > $(BENCH_RUNTIME_ST) 2>&1
-	@test "$$(grep -c '^benchmark=$(LIB_NAME)_st ' $(BENCH_RUNTIME_ST))" -eq 1 || { echo "ERROR: ST benchmark did not complete; see $(BENCH_RUNTIME_ST)"; exit 1; }
+	@test "$$(grep -c '^Benchmark finished[.]$$' $(BENCH_RUNTIME_ST))" -eq 1 || { echo "ERROR: ST benchmark did not complete; see $(BENCH_RUNTIME_ST)"; exit 1; }
 	@grep -q "data_mode=$(DATA_MODE)" $(BENCH_RUNTIME_ST) || { echo "ERROR: ST data mode mismatch; see $(BENCH_RUNTIME_ST)"; exit 1; }
 	@grep -q 'elapsed_seconds=' $(BENCH_RUNTIME_ST) || { echo "ERROR: ST runtime output is incomplete; see $(BENCH_RUNTIME_ST)"; exit 1; }
 	@$(PERF) report -i $(PERF_DATA_ST) $(REPORT_OPT) --dsos $(BENCH_BIN) --stdio > $(REPORT_FILE_ST)
@@ -371,10 +416,10 @@ bench_st: $(FAMILY_SYMLINK) $(BENCH_BIN_ST)
 bench_mt: $(FAMILY_SYMLINK) $(BENCH_BIN_MT)
 	@echo "=== MT benchmark for report: $(REPORT_NAME) (CONFIG=$(CONFIG)) ==="
 	@$(MKDIR) $(REPORTS_DIR)
-	@sudo sysctl -w kernel.perf_event_max_sample_rate=20000 > /dev/null	
+	@sudo sysctl -w kernel.perf_event_max_sample_rate=20000 > /dev/null
 	@rm -f $(BENCH_RUNTIME_MT)
 	@taskset --cpu-list $(MT_CPU_LIST) $(PERF) record $(RECORD_OPT) -o $(PERF_DATA_MT) -- $(BENCH_BIN_MT) --threads $(MT_THREADS) --total-iterations $(MT_TOTAL_ITERATIONS) --data-mode $(DATA_MODE) > $(BENCH_RUNTIME_MT) 2>&1
-	@test "$$(grep -c '^benchmark=$(LIB_NAME)_mt ' $(BENCH_RUNTIME_MT))" -eq 1 || { echo "ERROR: MT benchmark did not complete; see $(BENCH_RUNTIME_MT)"; exit 1; }
+	@test "$$(grep -c '^Benchmark finished[.]$$' $(BENCH_RUNTIME_MT))" -eq 1 || { echo "ERROR: MT benchmark did not complete; see $(BENCH_RUNTIME_MT)"; exit 1; }
 	@grep -q "data_mode=$(DATA_MODE)" $(BENCH_RUNTIME_MT) || { echo "ERROR: MT data mode mismatch; see $(BENCH_RUNTIME_MT)"; exit 1; }
 	@grep -q 'elapsed_seconds=' $(BENCH_RUNTIME_MT) || { echo "ERROR: MT runtime output is incomplete; see $(BENCH_RUNTIME_MT)"; exit 1; }
 	@$(PERF) report -i $(PERF_DATA_MT) $(REPORT_OPT) --dsos $(BENCH_BIN)_mt --stdio > $(REPORT_FILE_MT)
@@ -385,11 +430,65 @@ bench_mt: $(FAMILY_SYMLINK) $(BENCH_BIN_MT)
 # Пример: make bench_stat CONFIG=release REPORT_NAME=baseline PERF_RUNS=7 DATA_MODE=all_nonzero
 bench_full: $(FAMILY_SYMLINK) $(REPORTS_DIR)
 	@set -e; for mode in all_zero all_nonzero mixed; do \
-		report_name="$(REPORT_NAME)_$${mode}"; \
-		echo "=== Full benchmark mode: $${mode}, report=$${report_name} ==="; \
-		$(MAKE) --no-print-directory bench CONFIG=$(CONFIG) REPORT_NAME=$${report_name} DATA_MODE=$${mode} KEEP_PERF=$(KEEP_PERF); \
-		$(MAKE) --no-print-directory bench_stat CONFIG=$(CONFIG) REPORT_NAME=$${report_name} DATA_MODE=$${mode} PERF_RUNS=$(PERF_RUNS); \
+	        report_name="$(REPORT_NAME)_$${mode}"; \
+	        echo "=== Full benchmark mode: $${mode}, report=$${report_name} ==="; \
+	        $(MAKE) --no-print-directory bench CONFIG=$(CONFIG) REPORT_NAME=$${report_name} DATA_MODE=$${mode} KEEP_PERF=$(KEEP_PERF); \
+	        $(MAKE) --no-print-directory bench_stat CONFIG=$(CONFIG) REPORT_NAME=$${report_name} DATA_MODE=$${mode} PERF_RUNS=$(PERF_RUNS); \
 	done
+
+# Cloud environment workflow: use only software events supported without a PMU.
+# The regular system perf is not compatible with the cloud kernel, so the
+# kernel-matched binary configured by PERF is required. No symlink is created.
+bench_cl: PERF_EVENTS := task-clock,context-switches,cpu-migrations,page-faults
+bench_cl: $(FAMILY_SYMLINK) $(REPORTS_DIR)
+	@echo "=== Cloud benchmark (CONFIG=$(CONFIG), RUNS=$(PERF_RUNS)) ==="
+	@if [ ! -x "$(PERF)" ]; then \
+	echo "INFO: compatible perf is missing at $(PERF); standard perf cannot be used for this cloud kernel."; \
+	exit 1; \
+	fi
+	@echo "INFO: no standard-perf symlink is created; using kernel-matched $(PERF)."
+	@echo "INFO: hardware PMU events are unavailable; using PERF_EVENTS=$(PERF_EVENTS)."
+	@set -e; for mode in all_zero all_nonzero mixed; do \
+	report_name="$(REPORT_NAME)_cl_$${mode}"; \
+	echo "=== Cloud benchmark mode: $${mode}, report=$${report_name} ==="; \
+	$(MAKE) --no-print-directory bench_stat \
+	    CONFIG=$(CONFIG) REPORT_NAME=$${report_name} DATA_MODE=$${mode} \
+	    PERF_RUNS=$(PERF_RUNS) PERF_EVENTS=$(PERF_EVENTS) \
+	    MT_THREADS=$(MT_THREADS) MT_CPU_LIST=$(MT_CPU_LIST) \
+	    MT_TOTAL_ITERATIONS=$(MT_TOTAL_ITERATIONS); \
+	done
+
+
+# Parameterized direct-run matrix. It uses no PMU events and is therefore
+# available in cloud environments where only software perf events are exposed.
+# It writes raw JSON samples and a statistical summary; BENCH_BASELINE enables
+# an explicit regression gate against a reviewed reference artifact.
+bench_matrix: CONFIG := release
+bench_matrix: $(FAMILY_SYMLINK) $(BENCH_BINS) $(BENCHMARK_CORE_LIB) $(BENCH_MATRIX_TOOL) $(BENCH_STATS_TOOL) | $(REPORTS_DIR)
+	@echo "=== Parameterized C11 benchmark matrix (CONFIG=$(CONFIG), RUNS=$(BENCH_MATRIX_REPETITIONS)) ==="
+	@test -x "$(BENCH_MATRIX_TOOL)" || { echo "ERROR: missing C11 matrix tool: $(BENCH_MATRIX_TOOL)"; exit 1; }
+	@test -x "$(BENCH_STATS_TOOL)" || { echo "ERROR: missing C11 statistics tool: $(BENCH_STATS_TOOL)"; exit 1; }
+	@test $$(( $(BENCH_MATRIX_MT_TOTAL_ITERATIONS) % $(MT_THREADS) )) -eq 0 || { echo "ERROR: BENCH_MATRIX_MT_TOTAL_ITERATIONS must be divisible by MT_THREADS"; exit 1; }
+	@$(BENCH_MATRIX_TOOL) \
+	    --manifest $(BENCH_MATRIX_PROFILE) \
+	    --output $(BENCH_MATRIX_REPORT) \
+	    --st-binary $(BENCH_BIN_ST) \
+	    --mt-binary $(BENCH_BIN_MT) \
+	    --repetitions $(BENCH_MATRIX_REPETITIONS) \
+	    --iterations $(BENCH_MATRIX_ITERATIONS) \
+	    --mt-total-iterations $(BENCH_MATRIX_MT_TOTAL_ITERATIONS) \
+	    --threads $(MT_THREADS) \
+	    --warmup $(BENCH_MATRIX_WARMUP) \
+	    --data-count $(BENCH_MATRIX_DATA_COUNT) \
+	    --seed $(BENCH_MATRIX_SEED) \
+	    --timeout-seconds $(BENCH_MATRIX_TIMEOUT_SECONDS)
+	@$(BENCH_STATS_TOOL) \
+	    --input $(BENCH_MATRIX_REPORT) \
+	    --output $(BENCH_MATRIX_SUMMARY) \
+	    --threshold-pct $(BENCH_REGRESSION_THRESHOLD_PCT) \
+	    $(if $(strip $(BENCH_BASELINE)),--baseline $(BENCH_BASELINE))
+	@echo "Matrix samples: $(BENCH_MATRIX_REPORT)"
+	@echo "Matrix summary: $(BENCH_MATRIX_SUMMARY)"
 
 bench_stat: bench_stat_st bench_stat_mt
 	@echo "ST stat: $(STAT_FILE_ST)"
@@ -400,7 +499,7 @@ bench_stat_st: $(FAMILY_SYMLINK) $(BENCH_BIN_ST)
 	@$(MKDIR) $(REPORTS_DIR)
 	@printf 'CONFIG=$(CONFIG) DATA_MODE=$(DATA_MODE) PERF_RUNS=$(PERF_RUNS) PERF_EVENTS=$(PERF_EVENTS) CPU_LIST=0\n' > $(STAT_RUNTIME_ST)
 	@taskset 0x1 $(PERF) stat -r $(PERF_RUNS) -x, -e $(PERF_EVENTS) -o $(STAT_FILE_ST) -- $(BENCH_BIN_ST) --data-mode $(DATA_MODE) >> $(STAT_RUNTIME_ST) 2>&1
-	@test "$$(grep -c '^benchmark=$(LIB_NAME)_st ' $(STAT_RUNTIME_ST))" -eq $(PERF_RUNS) || { echo "ERROR: ST perf stat expected $(PERF_RUNS) completed runs; see $(STAT_RUNTIME_ST)"; exit 1; }
+	@test "$$(grep -c '^Benchmark finished[.]$$' $(STAT_RUNTIME_ST))" -eq $(PERF_RUNS) || { echo "ERROR: ST perf stat expected $(PERF_RUNS) completed runs; see $(STAT_RUNTIME_ST)"; exit 1; }
 	@grep -q "data_mode=$(DATA_MODE)" $(STAT_RUNTIME_ST) || { echo "ERROR: ST perf stat data mode mismatch; see $(STAT_RUNTIME_ST)"; exit 1; }
 	@grep -q 'elapsed_seconds=' $(STAT_RUNTIME_ST) || { echo "ERROR: ST perf stat runtime output is incomplete; see $(STAT_RUNTIME_ST)"; exit 1; }
 
@@ -409,22 +508,22 @@ bench_stat_mt: $(FAMILY_SYMLINK) $(BENCH_BIN_MT)
 	@$(MKDIR) $(REPORTS_DIR)
 	@printf 'CONFIG=$(CONFIG) DATA_MODE=$(DATA_MODE) PERF_RUNS=$(PERF_RUNS) PERF_EVENTS=$(PERF_EVENTS) MT_THREADS=$(MT_THREADS) MT_CPU_LIST=$(MT_CPU_LIST) MT_TOTAL_ITERATIONS=$(MT_TOTAL_ITERATIONS)\n' > $(STAT_RUNTIME_MT)
 	@taskset --cpu-list $(MT_CPU_LIST) $(PERF) stat -r $(PERF_RUNS) -x, -e $(PERF_EVENTS) -o $(STAT_FILE_MT) -- $(BENCH_BIN_MT) --threads $(MT_THREADS) --total-iterations $(MT_TOTAL_ITERATIONS) --data-mode $(DATA_MODE) >> $(STAT_RUNTIME_MT) 2>&1
-	@test "$$(grep -c '^benchmark=$(LIB_NAME)_mt ' $(STAT_RUNTIME_MT))" -eq $(PERF_RUNS) || { echo "ERROR: MT perf stat expected $(PERF_RUNS) completed runs; see $(STAT_RUNTIME_MT)"; exit 1; }
+	@test "$$(grep -c '^Benchmark finished[.]$$' $(STAT_RUNTIME_MT))" -eq $(PERF_RUNS) || { echo "ERROR: MT perf stat expected $(PERF_RUNS) completed runs; see $(STAT_RUNTIME_MT)"; exit 1; }
 	@grep -q "data_mode=$(DATA_MODE)" $(STAT_RUNTIME_MT) || { echo "ERROR: MT perf stat data mode mismatch; see $(STAT_RUNTIME_MT)"; exit 1; }
 	@grep -q 'elapsed_seconds=' $(STAT_RUNTIME_MT) || { echo "ERROR: MT perf stat runtime output is incomplete; see $(STAT_RUNTIME_MT)"; exit 1; }
 
 install: clean $(FAMILY_SYMLINK) $(OBJ) $(OBJECTS) | $(DIST_INCLUDE_DIR) $(DIST_LIB_DIR)
 	@printf "%s" "Installing product to $(DIST_DIR)/ (CONFIG=$(CONFIG))..."
 	@if [ -f "$(INCLUDE_DIR)/$(FAMILY_NAME).h" ]; then \
-		cp "$(INCLUDE_DIR)/$(FAMILY_NAME).h" "$(DIST_INCLUDE_DIR)/"; \
+	        cp "$(INCLUDE_DIR)/$(FAMILY_NAME).h" "$(DIST_INCLUDE_DIR)/"; \
 	fi
 	@if [ ! -f "$(DIST_INCLUDE_DIR)/$(FAMILY_NAME).h" ]; then \
-		cp "$(FAMILY_HEADER)" "$(DIST_INCLUDE_DIR)/$(FAMILY_NAME).h"; \
-	fi	
+	        cp "$(FAMILY_HEADER)" "$(DIST_INCLUDE_DIR)/$(FAMILY_NAME).h"; \
+	fi
 	@cp $(HEADER) $(SRC_SUBMODULES_HEADERS) $(DIST_INCLUDE_DIR)/
 	@cp $(OBJ) $(OBJECTS) $(DIST_LIB_DIR)/
-#	@$(foreach d,$(DIST_SUBMODULES), \
-		cd $(DIST_LIB_DIR) && $(AR) x ../../$(LIBS_DIR)/$(d)/dist/lib$(subst -,_,$(d)).a && cd ../..; \
+#       @$(foreach d,$(DIST_SUBMODULES), \
+	        cd $(DIST_LIB_DIR) && $(AR) x ../../$(LIBS_DIR)/$(d)/dist/lib$(subst -,_,$(d)).a && cd ../..; \
 	)
 	@echo "Ok"
 	@tree $(DIST_DIR)/
@@ -440,68 +539,68 @@ generate-header: $(FAMILY_SYMLINK)
 	@echo "#define $(UPPER_LIB_NAME)_SINGLE_H" >> $(SINGLE_HEADER)
 	@echo "" >> $(SINGLE_HEADER)
 	@if [ -n "$(strip $(SRC_SUBMODULES_HEADERS))" ]; then \
-		sed -e '/#include "$(FAMILY_NAME).h"/d' -e '/#include <$(FAMILY_NAME).h>/d' $(SRC_SUBMODULES_HEADERS) >> $(SINGLE_HEADER); \
+	        sed -e '/#include "$(FAMILY_NAME).h"/d' -e '/#include <$(FAMILY_NAME).h>/d' $(SRC_SUBMODULES_HEADERS) >> $(SINGLE_HEADER); \
 	else \
-		echo "\n\tSRC-Submodules is empty. Use family header"; \
-		sed -e '/#include "$(FAMILY_NAME).h"/d' -e '/#include <$(FAMILY_NAME).h>/d' $(FAMILY_HEADER) >> $(SINGLE_HEADER); \
+	        echo "\n\tSRC-Submodules is empty. Use family header"; \
+	        sed -e '/#include "$(FAMILY_NAME).h"/d' -e '/#include <$(FAMILY_NAME).h>/d' $(FAMILY_HEADER) >> $(SINGLE_HEADER); \
 	fi
-	#echo "\n/* --- Included from include/$(LIB_NAME).h --- */" >> $(SINGLE_HEADER)
-	sed -e '/$(UPPER_LIB_NAME)_H/d' -e '/#include <$(FAMILY_NAME).h>/d' -e '/#include "$(FAMILY_NAME).h"/d' $(HEADER) >> $(SINGLE_HEADER)	
+	echo "\n/* --- Included from include/$(LIB_NAME).h --- */" >> $(SINGLE_HEADER)
+	sed -e '/$(UPPER_LIB_NAME)_H/d' -e '/#include <$(FAMILY_NAME).h>/d' -e '/#include "$(FAMILY_NAME).h"/d' $(HEADER) >> $(SINGLE_HEADER)
 	@echo "" >> $(SINGLE_HEADER)
 	@echo "#endif // $(UPPER_LIB_NAME)_SINGLE_H" >> $(SINGLE_HEADER)
 	@echo "\n\tStep 1: Removing duplicate code blocks..."
 	@awk ' \
 	BEGIN { in_guard = 0; depth = 0; } \
 	{ \
-		stripped = $$0; sub(/^[[:space:]]*/, "", stripped); \
-		if (in_guard == 1) { \
-			if (stripped ~ /^#(if|ifndef|ifdef)/) { depth++; } \
-			else if (stripped ~ /^#endif/) { \
-				depth--; \
-				if (depth == 0) in_guard = 0; \
-			} \
-			next; \
-		} \
-		if (stripped ~ /^#ifndef[[:space:]]+[A-Za-z0-9_]+/) { \
-			split(stripped, p, /[[:space:]]+/); name = p[2]; \
-			if (seen[name]) { in_guard = 1; depth = 1; next; } \
-			seen[name] = 1; \
-		} \
-		print $$0; \
+	        stripped = $$0; sub(/^[[:space:]]*/, "", stripped); \
+	        if (in_guard == 1) { \
+	                if (stripped ~ /^#(if|ifndef|ifdef)/) { depth++; } \
+	                else if (stripped ~ /^#endif/) { \
+	                        depth--; \
+	                        if (depth == 0) in_guard = 0; \
+	                } \
+	                next; \
+	        } \
+	        if (stripped ~ /^#ifndef[[:space:]]+[A-Za-z0-9_]+/) { \
+	                split(stripped, p, /[[:space:]]+/); name = p[2]; \
+	                if (seen[name]) { in_guard = 1; depth = 1; next; } \
+	                seen[name] = 1; \
+	        } \
+	        print $$0; \
 	}' $(SINGLE_HEADER) > $(SINGLE_HEADER)_tmp.h
 	@echo "\tStep 2: Removing duplicate Doxygen blocks..."
 	@awk ' \
 	BEGIN { in_comment = 0; } \
 	{ \
-		stripped = $$0; sub(/^[[:space:]]*/, "", stripped); \
-		if (in_comment == 1) { \
-			if (stripped ~ /\*\//) { in_comment = 0; } \
-			next; \
-		} \
-		if (stripped ~ /^\/\*\*/) { \
-			# Мы нашли Doxygen-блок. Проверяем, видели ли мы его раньше. \
-			# Чтобы идентифицировать блок, мы создаем хеш из первых двух строк. \
-			block_id = stripped; \
-			getline next_line; \
-			block_id = block_id " " next_line; \
-			\
-			if (seen_doc[block_id]) { \
-				in_comment = 1; \
-				# Нужно пропустить текущую строку, так как она уже в block_id \
-				# Но мы должны проверить, не закрылся ли комментарий сразу \
-				if (next_line ~ /\*\//) { in_comment = 0; } \
-				next; \
-			} \
-			seen_doc[block_id] = 1; \
-			print stripped; \
-			print next_line; \
-			next; \
-		} \
-		print $$0; \
+	        stripped = $$0; sub(/^[[:space:]]*/, "", stripped); \
+	        if (in_comment == 1) { \
+	                if (stripped ~ /\*\//) { in_comment = 0; } \
+	                next; \
+	        } \
+	        if (stripped ~ /^\/\*\*/) { \
+	                # Мы нашли Doxygen-блок. Проверяем, видели ли мы его раньше. \
+	                # Чтобы идентифицировать блок, мы создаем хеш из первых двух строк. \
+	                block_id = stripped; \
+	                getline next_line; \
+	                block_id = block_id " " next_line; \
+	                \
+	                if (seen_doc[block_id]) { \
+	                        in_comment = 1; \
+	                        # Нужно пропустить текущую строку, так как она уже в block_id \
+	                        # Но мы должны проверить, не закрылся ли комментарий сразу \
+	                        if (next_line ~ /\*\//) { in_comment = 0; } \
+	                        next; \
+	                } \
+	                seen_doc[block_id] = 1; \
+	                print stripped; \
+	                print next_line; \
+	                next; \
+	        } \
+	        print $$0; \
 	}' $(SINGLE_HEADER)_tmp.h > $(SINGLE_HEADER)_final.h
 	@rm -f $(SINGLE_HEADER)_tmp.h
 	@mv $(SINGLE_HEADER)_final.h $(SINGLE_HEADER)
-	@echo "Done. Result saved to $(SINGLE_HEADER)"		
+	@echo "Done. Result saved to $(SINGLE_HEADER)"
 	@echo "Ok"
 
 dist: clean $(FAMILY_SYMLINK)
@@ -514,7 +613,7 @@ dist: clean $(FAMILY_SYMLINK)
 	@echo "Ok"
 	@printf "%s" "Create static library lib$(LIB_NAME).a ..."
 	@$(AR) rcs $(STATIC_LIB) $(OBJ) $(OBJECTS)
-#	@$(foreach d,$(DIST_SUBMODULES), \
+#       @$(foreach d,$(DIST_SUBMODULES), \
 	$(MKDIR) $(BUILD_DIR)/tmp_$(d) && \
 	cd $(BUILD_DIR)/tmp_$(d) && \
 	$(AR) x ../../$(LIBS_DIR)/$(d)/dist/lib$(subst -,_,$(d)).a && \
@@ -557,7 +656,7 @@ endif
 
 $(OBJECTS):
 	@echo "Building source submodules... (CONFIG=$(CONFIG))... "
-	@$(foreach d,$(SRC_SUBMODULES), \
+	@$(foreach d,$(GENERIC_BUILD_SUBMODULES), \
 	  (echo "\tBuild for $(d) ..." && $(MAKE) -C $(LIBS_DIR)/$(d) -s build CONFIG=release USE_ASM=auto CFLAGS+=-Wl,-z,noexecstack) || echo "\n\t\t⚠️  $(d) no rule build\n"; \
 	)
 
@@ -566,11 +665,27 @@ $(BIN_DIR)/%: $(TESTS_DIR)/%.c $(OBJ) $(OBJECTS) | $(BIN_DIR)
 	@$(MKDIR) $(BIN_DIR)
 	@$(CC) $(CFLAGS) $< $(OBJECTS) $(OBJ) -o $@ $(LDFLAGS) \
 	  $(if $(filter %_mt,$*),-pthread)
-$(BENCH_BIN_ST): $(BENCH_SRC_ST) $(OBJ) $(OBJECTS) | $(BIN_DIR)
-$(BENCH_BIN_MT): $(BENCH_SRC_MT) $(OBJ) $(OBJECTS) | $(BIN_DIR)
-$(BIN_DIR)/bench_%: $(BENCH_DIR)/bench_%.c $(OBJ) $(OBJECTS) | $(BIN_DIR)
-	@$(MAKE) -s build CONFIG=debug
-	@$(CC) $(CFLAGS) -g $< $(OBJECTS) $(OBJ) -o $@ $(LDFLAGS) $(if $(filter %_mt,$*),-pthread)
+benchmark_framework:
+# @$(MAKE) -C $(BENCHMARK_FRAMEWORK_DIR) build CONFIG=release
+
+docs:
+	@$(MKDIR) $(BUILD_DIR)/docs
+	@sed 's#^OUTPUT_DIRECTORY.*#OUTPUT_DIRECTORY       = $(abspath $(BUILD_DIR)/docs)#; s#^STRIP_FROM_PATH.*#STRIP_FROM_PATH        = $(abspath .)#' docs/Doxyfile | doxygen -
+
+$(BENCHMARK_CORE_LIB): benchmark_framework
+
+$(BENCH_ADAPTER_OBJ): $(BENCH_ADAPTER_SOURCE) $(BENCH_ADAPTER_HEADER) $(BENCHMARK_CORE_LIB) | $(BUILD_DIR)
+#	@echo "Compiling C11 bignum benchmark adapter: $< -> $@ (CONFIG=$(CONFIG))..."
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(BENCH_BIN_ST): $(BENCH_SRC_ST) $(BENCH_ADAPTER_OBJ) $(BENCHMARK_CORE_LIB) $(OBJ) $(OBJECTS) | $(BIN_DIR)
+	@$(CC) $(CFLAGS) $< $(BENCH_ADAPTER_OBJ) $(OBJECTS) $(OBJ) $(BENCHMARK_CORE_LIB) -o $@ $(LDFLAGS) -pthread
+
+$(BENCH_BIN_MT): $(BENCH_SRC_MT) $(BENCH_ADAPTER_OBJ) $(BENCHMARK_CORE_LIB) $(OBJ) $(OBJECTS) | $(BIN_DIR)
+	@$(CC) $(CFLAGS) $< $(BENCH_ADAPTER_OBJ) $(OBJECTS) $(OBJ) $(BENCHMARK_CORE_LIB) -o $@ $(LDFLAGS) -pthread
+
+$(BENCH_ADAPTER_TEST_BIN): $(BENCH_ADAPTER_TEST_SOURCE) $(BENCH_ADAPTER_OBJ) $(BENCHMARK_CORE_LIB) $(OBJ) $(OBJECTS) | $(BIN_DIR)
+	@$(CC) $(CFLAGS) $< $(BENCH_ADAPTER_OBJ) $(OBJECTS) $(OBJ) $(BENCHMARK_CORE_LIB) -o $@ $(LDFLAGS) -pthread
 
 # --- Utility Targets ---
 $(BIN_DIR) $(REPORTS_DIR) $(DIST_INCLUDE_DIR) $(DIST_LIB_DIR):
@@ -580,15 +695,15 @@ $(BIN_DIR) $(REPORTS_DIR) $(DIST_INCLUDE_DIR) $(DIST_LIB_DIR):
 # the correct source make will consider it up‑to‑date.
 $(FAMILY_SYMLINK): $(FAMILY_HEADER)
 	@echo "Creating symlink: $@ → $(notdir $<)"
-	@ln -sf $(notdir $<) $@	
+	@ln -sf $(notdir $<) $@
 
 # Удаляем только если это действительно симлинк
 unlink-symlink:
 	@if [ -L "$(FAMILY_PATH)/$(FAMILY_NAME).h" ]; then \
-		echo "Cleaning up symlink $(FAMILY_PATH)/$(FAMILY_NAME).h"; \
-		rm -f "$(FAMILY_PATH)/$(FAMILY_NAME).h"; \
+	        echo "Cleaning up symlink $(FAMILY_PATH)/$(FAMILY_NAME).h"; \
+	        rm -f "$(FAMILY_PATH)/$(FAMILY_NAME).h"; \
 	else \
-		echo "$(FAMILY_PATH)/$(FAMILY_NAME).h is not symlink. Leave untuched..."; \
+	        echo "$(FAMILY_PATH)/$(FAMILY_NAME).h is not symlink. Leave untuched..."; \
 	fi
 
 lint:
@@ -601,7 +716,7 @@ lint:
 clean:
 	@$(MAKE) unlink-symlink --no-print-directory
 	@echo "Cleaning up build artifacts (build/, bin/, dist/)..."
-	@$(RM) $(BUILD_DIR) $(BIN_DIR) $(DIST_DIR) 
+	@$(RM) $(BUILD_DIR) $(BIN_DIR) $(DIST_DIR)
 	@echo "Cleaning up submodule artifacts:" ;
 	@$(foreach d,$(SRC_SUBMODULES), \
 	  if [ -f $(LIBS_DIR)/$(d)/Makefile ]; then \
@@ -616,31 +731,34 @@ help:
 	@echo "Usage: make <target> [CONFIG=release] [REPORT_NAME=my_report]"
 	@echo ""
 	@echo "Main Targets:"
-	@echo "  all/build      Builds the main object file."
-	@echo "  lint           Static analysis on C sources."
-	@echo "  bench          perf record/report benchmark; raw perf.data kept by default."
-	@echo "  bench_full     Run bench and bench_stat for all_zero, all_nonzero and mixed."
-	@echo "  bench_stat     Repeated perf stat runs for ST and MT."
-	@echo "  bench_stat_st  Repeated ST perf stat runs."
-	@echo "  bench_stat_mt  Repeated MT perf stat runs."
-	@echo ""
-	@echo "Benchmark variables: DATA_MODE=all_nonzero|all_zero|mixed PERF_RUNS=5 PERF_EVENTS=<events> KEEP_PERF=1"
-	@echo "  MT defaults: MT_THREADS=2 MT_CPU_LIST=0-1 MT_TOTAL_ITERATIONS=3200000000"
-	@echo "  MT-1: make bench_mt MT_THREADS=1 MT_CPU_LIST=0 MT_TOTAL_ITERATIONS=3200000000"
-	@echo "  MT-2: make bench_mt MT_THREADS=2 MT_CPU_LIST=0-1 MT_TOTAL_ITERATIONS=3200000000"
-	@echo "  MT_TOTAL_ITERATIONS is divided evenly across MT_THREADS."
-	@echo "  test           Builds and runs all unit tests."
-	@echo "  test_sanitize  Runs tests under sanitizer: make test_sanitize SAN={address|undefined}"
-	@echo "  test_helgrind  Runs *_mt tests under valgrind --tool=helgrind for race detection."
-	@echo "  bench          Runs performance benchmarks with perf."
-	@echo "  install        Installs product into dist/ for internal use."
-	@echo "  dist           Builds a single-header + static-lib distribution in dist/."
-	@echo "  clean          Removes build/, bin/, dist/."
-	@echo "  help           Shows this help message."
+	@echo "  all/build        Builds the main object file."
+	@echo "  lint             Static analysis on C sources."
+	@echo "  test             Builds and runs all unit tests."
+	@echo "  test_sanitize   Runs tests under sanitizer: make test_sanitize SAN={address|undefined}"
+	@echo "  test_helgrind   Runs *_mt tests under valgrind --tool=helgrind for race detection."
+	@echo "  bench            perf record/report benchmark; raw perf.data kept by default."
+	@echo "  bench_full       Run bench and bench_stat for all_zero, all_nonzero and mixed."
+	@echo "  bench_cl         Cloud-compatible repeated perf stat for all modes (software events only)."
+	@echo "  bench_stat       Repeated perf stat runs for ST and MT."
+	@echo "  bench_stat_st   Repeated ST perf stat runs."
+	@echo "  bench_stat_mt   Repeated MT perf stat runs."
+	@echo "  bench_matrix    Run pinned C11 JSON matrix and statistics aggregation."
+	@echo "  install          Installs product into dist/ for internal use."
+	@echo "  dist             Builds a single-header + static-lib distribution in dist/."
+	@echo "  clean            Removes build/, bin/, dist/."
+	@echo "  help             Shows this help message."
 	@echo ""
 	@echo "Logs:"
 	@echo "  Sanitizer logs: \$$(BIN_DIR)/sanitize_<test>.log"
 	@echo "  Helgrind logs:  \$$(BIN_DIR)/helgrind_<test>_mt.log"
+	@echo ""
+	@echo "Benchmark variables: DATA_MODE=all_nonzero|all_zero|mixed PERF_RUNS=5 PERF_EVENTS=<events> KEEP_PERF=1"
+	@echo "  Matrix: BENCH_MATRIX_PROFILE=benchmarks/profiles/bignum_template_full.json BENCH_MATRIX_REPETITIONS=7"
+	@echo "  BENCH_MATRIX_ITERATIONS=200000000 BENCH_MATRIX_MT_TOTAL_ITERATIONS=320000000 BENCH_BASELINE=<reviewed JSON>"
+	@echo "  MT defaults: MT_THREADS=2 MT_CPU_LIST=0-1 MT_TOTAL_ITERATIONS=3200000000"
+	@echo "  MT-1: make bench_mt MT_THREADS=1 MT_CPU_LIST=0 MT_TOTAL_ITERATIONS=3200000000"
+	@echo "  MT-2: make bench_mt MT_THREADS=2 MT_CPU_LIST=0-1 MT_TOTAL_ITERATIONS=3200000000"
+	@echo "  MT_TOTAL_ITERATIONS is divided evenly across MT_THREADS."
 	@echo ""
 	@echo "Optimization Cycle Example:"
 	@echo "  1. make bench REPORT_NAME=baseline"
@@ -648,6 +766,23 @@ help:
 	@echo "  3. make test"
 	@echo "  4. make bench REPORT_NAME=opt_v1"
 	@echo "  5. diff -u benchmarks/reports/baseline_st.txt benchmarks/reports/opt_v1_st.txt"
+	@echo ""
+	@echo "Parameterized Matrix Benchmark Example:"
+	@echo "  Runs the pinned C11 benchmark matrix without PMU/perf events and writes raw samples plus a JSON summary."
+	@echo "  Standard smoke matrix:"
+	@echo "    make clean"
+	@echo "    make bench_matrix CONFIG=release REPORT_NAME=baseline BENCH_MATRIX_PROFILE=benchmarks/profiles/bignum_template_standard.json BENCH_MATRIX_REPETITIONS=7"
+	@echo "  Full matrix with the default workload:"
+	@echo "    make bench_matrix CONFIG=release REPORT_NAME=baseline BENCH_MATRIX_PROFILE=benchmarks/profiles/bignum_template_full.json BENCH_MATRIX_REPETITIONS=7"
+	@echo "  Compare a candidate with a previous run:"
+	@echo "    make clean"
+	@echo "    make bench_matrix CONFIG=release REPORT_NAME=opt_v1 BENCH_MATRIX_PROFILE=benchmarks/profiles/bignum_template_standard.json BENCH_MATRIX_REPETITIONS=7"
+	@echo "    diff -u benchmarks/reports/baseline_matrix_summary.json benchmarks/reports/opt_v1_matrix_summary.json"
+	@echo "  Enable the reviewed-baseline regression gate:"
+	@echo "    make bench_matrix CONFIG=release REPORT_NAME=opt_v1 BENCH_BASELINE=benchmarks/reports/baseline_matrix_summary.json"
+	@echo "  Smoke-test controls: BENCH_MATRIX_ITERATIONS=N BENCH_MATRIX_MT_TOTAL_ITERATIONS=N BENCH_MATRIX_WARMUP=N BENCH_MATRIX_DATA_COUNT=N BENCH_MATRIX_SEED=N"
+	@echo "  BENCH_MATRIX_MT_TOTAL_ITERATIONS must be divisible by MT_THREADS; use the default workload for timing studies."
+	@echo "  Output: benchmarks/reports/<REPORT_NAME>_matrix.json and benchmarks/reports/<REPORT_NAME>_matrix_summary.json"
 	@echo ""
 	@echo "Repeated perf stat Comparison Example:"
 	@echo "  Input modes: all_nonzero measures the hot non-zero path; all_zero measures zero path; mixed alternates 0/non-zero to expose branch effects."
@@ -664,6 +799,13 @@ help:
 	@echo " 11. perf report -i benchmarks/reports/baseline_st.perf.data --stdio"
 	@echo " 12. perf report -i benchmarks/reports/opt_v1_st.perf.data --stdio"
 	@echo ""
+	@echo "Cloud three-mode study (requires a kernel-matched perf at \$$(PERF)):"
+	@echo "  make bench_cl CONFIG=release REPORT_NAME=baseline PERF_RUNS=7"
+	@echo "  Uses task-clock, context-switches, cpu-migrations and page-faults; no raw perf.data is recorded."
+	@echo "  Smoke-test controls (environment, not Make variables):"
+	@echo "    BIGNUM_BENCH_ITERATIONS=N BIGNUM_BENCH_MT_TOTAL_ITERATIONS=N BIGNUM_BENCH_SEED=N"
+	@echo "    The MT total must be divisible by MT_THREADS; use the default workload for timing studies."
+	@echo ""
 	@echo "Full three-mode study:"
 	@echo "  make bench_full CONFIG=release REPORT_NAME=baseline PERF_RUNS=7 KEEP_PERF=1"
 	@echo "  Reports are suffixed _all_zero, _all_nonzero and _mixed."
@@ -671,7 +813,7 @@ help:
 show-calc:
 	@echo "REPOSITORY_NAME = '$(REPOSITORY_NAME)'"
 	@echo "FAMILY_NAME = '$(FAMILY_NAME)'"
-	@echo "OPERATION_NAME = '$(OPERATION_NAME)'"	
+	@echo "OPERATION_NAME = '$(OPERATION_NAME)'"
 	@echo "LIB_NAME = '$(LIB_NAME)'"
 	@echo "UPPER_LIB_NAME = '$(UPPER_LIB_NAME)'"
 	@echo "NP = '$(NP)'"
@@ -684,7 +826,7 @@ show-calc:
 	@echo "HEADER = '$(HEADER)'"
 	@echo "FAMILY_HEADER = '$(FAMILY_HEADER)'"
 	@echo "FAMILY_PATH = '$(FAMILY_PATH)'"
-	@echo "FAMILY_SYMLINK = '$(FAMILY_SYMLINK)'"	
+	@echo "FAMILY_SYMLINK = '$(FAMILY_SYMLINK)'"
 	@echo "SINGLE_HEADER = '$(SINGLE_HEADER)'"
 	@echo "SRC_EXT = '$(SRC_EXT)'"
 	@echo "USE_ASM = '$(USE_ASM)'"
@@ -692,19 +834,19 @@ show-calc:
 	@echo "SUBMODULES = '$(SUBMODULES)'"
 	@echo "CORE_NAME = '$(CORE_NAME)'"
 	@echo "SRC_SUBMODULES_INCLUDE_DIR = '$(SRC_SUBMODULES_INCLUDE_DIR)'"
-	@echo "DIST_SUBMODULES_INCLUDE_DIR = '$(DIST_SUBMODULES_INCLUDE_DIR)'"		
+	@echo "DIST_SUBMODULES_INCLUDE_DIR = '$(DIST_SUBMODULES_INCLUDE_DIR)'"
 	@echo "SUBMODULES_INCLUDE_DIR = '$(SUBMODULES_INCLUDE_DIR)'"
 	@echo "SUBMODULES_DIST_DIR = '$(SUBMODULES_DIST_DIR)'"
 	@echo "SUBMODULES_DIST_LIB = '$(SUBMODULES_DIST_LIB)'"
-	@echo "SRC_SUBMODULES_HEADERS_RAW = '$(SRC_SUBMODULES_HEADERS_RAW)'"	
-	@echo "SRC_SUBMODULES_HEADERS = '$(SRC_SUBMODULES_HEADERS)'"	
-	@echo "DIST_SUBMODULES_HEADERS_RAW = '$(DIST_SUBMODULES_HEADERS_RAW)'"	
-	@echo "DIST_SUBMODULES_HEADERS = '$(DIST_SUBMODULES_HEADERS)'"		
-	@echo "SUBMODULES_HEADERS_RAW = '$(SUBMODULES_HEADERS_RAW)'"	
+	@echo "SRC_SUBMODULES_HEADERS_RAW = '$(SRC_SUBMODULES_HEADERS_RAW)'"
+	@echo "SRC_SUBMODULES_HEADERS = '$(SRC_SUBMODULES_HEADERS)'"
+	@echo "DIST_SUBMODULES_HEADERS_RAW = '$(DIST_SUBMODULES_HEADERS_RAW)'"
+	@echo "DIST_SUBMODULES_HEADERS = '$(DIST_SUBMODULES_HEADERS)'"
+	@echo "SUBMODULES_HEADERS_RAW = '$(SUBMODULES_HEADERS_RAW)'"
 	@echo "SUBMODULES_HEADERS = '$(SUBMODULES_HEADERS)'"
 	@echo "TEST_BINS_MT = '$(TEST_BINS_MT)'"
 	@echo "TEST_BINS = '$(TEST_BINS)'"
 	@echo "SAN = $(SAN) ($(SAN_LABEL))"
 	@echo "HELGRIND = $(HELGRIND)"
-	@echo "SRC_SUBMODULES = '$(SRC_SUBMODULES)'"	
-	@echo "DIST_SUBMODULES = '$(DIST_SUBMODULES)'"	
+	@echo "SRC_SUBMODULES = '$(SRC_SUBMODULES)'"
+	@echo "DIST_SUBMODULES = '$(DIST_SUBMODULES)'"

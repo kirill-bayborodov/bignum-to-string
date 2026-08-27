@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "Standard reproducible matrix for bignum_to_string.",
+  "profiles": [
+    {
+      "id": "one-to_string",
+      "input_kind": "nonzero",
+      "operation_kind": "to_string",
+      "measure_mode": "kernel-only",
+      "size_profile": "one",
+      "capacity_profile": "normal"
+    },
+    {
+      "id": "quarter-to_string",
+      "input_kind": "nonzero",
+      "operation_kind": "to_string",
+      "measure_mode": "kernel-only",
+      "size_profile": "quarter",
+      "capacity_profile": "normal"
+    },
+    {
+      "id": "mixed-to_string",
+      "input_kind": "nonzero",
+      "operation_kind": "to_string",
+      "measure_mode": "end-to-end",
+      "size_profile": "variable",
+      "capacity_profile": "normal"
+    }
+  ]
+}
